@@ -13,545 +13,493 @@ class UrlFetchScreen extends StatefulWidget {
 }
 
 class _UrlFetchScreenState extends State<UrlFetchScreen> {
-  final _urlController = TextEditingController();
-  final _fileNameController = TextEditingController();
-  final _headersController = TextEditingController();
-  final _formKey = GlobalKey<FormState>();
-
-  bool _isProcessing = false;
-  bool _useBackground = true;
-  String? _activeWorkId;
-  BackgroundTaskStatus? _currentStatus;
-  VoidCallback? _cancelPoll;
-  final List<_FetchHistoryEntry> _history = [];
+  final TextEditingController _urlController = TextEditingController();
+  final List<_FetchTask> _tasks = [];
+  bool _backgroundMode = false;
+  bool _backgroundAvailable = false;
 
   @override
   void initState() {
     super.initState();
-    _checkBackgroundEnabled();
+    _checkBackgroundAvailability();
   }
 
-  Future<void> _checkBackgroundEnabled() async {
-    final enabled = await BackgroundTaskPreferences.isEnabled();
-    if (mounted) {
-      setState(() {
-        _useBackground = enabled;
-      });
+  Future<void> _checkBackgroundAvailability() async {
+    if (!isWeb() && isAndroid()) {
+      final enabled = await BackgroundTaskPrefs.isEnabled();
+      setState(() => _backgroundAvailable = enabled);
     }
+  }
+
+  Future<String> _getOutputDirectory() async {
+    if (isAndroid()) {
+      final dir = Directory('/storage/emulated/0/Download/RevEngi');
+      if (!dir.existsSync()) await dir.create(recursive: true);
+      return dir.path;
+    }
+    final dir = Directory.systemTemp.createTempSync('url_fetch_');
+    return dir.path;
+  }
+
+  Future<void> _startFetch() async {
+    final url = _urlController.text.trim();
+    if (url.isEmpty) return;
+
+    if (!Uri.tryParse(url)!.hasScheme) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter a valid URL with scheme (https://...)')),
+      );
+      return;
+    }
+
+    final outputPath = await _getOutputDirectory();
+
+    if (_backgroundMode && _backgroundAvailable) {
+      final workId = await BackgroundTaskManager.scheduleUrlFetch(
+        url: url,
+        outputPath: outputPath,
+      );
+
+      if (workId != null) {
+        final task = _FetchTask(
+          url: url,
+          workId: workId,
+          isBackground: true,
+        );
+
+        setState(() {
+          _tasks.insert(0, task);
+          _urlController.clear();
+        });
+
+        _watchBackgroundTask(task);
+      }
+    } else {
+      // Foreground fetch -- schedule via WorkManager but treat as immediate
+      final workId = await BackgroundTaskManager.scheduleUrlFetch(
+        url: url,
+        outputPath: outputPath,
+      );
+
+      if (workId != null) {
+        final task = _FetchTask(
+          url: url,
+          workId: workId,
+          isBackground: false,
+        );
+
+        setState(() {
+          _tasks.insert(0, task);
+          _urlController.clear();
+        });
+
+        _watchBackgroundTask(task);
+      } else {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to schedule download. Check if background processing is enabled in Settings.'),
+          ),
+        );
+      }
+    }
+  }
+
+  void _watchBackgroundTask(_FetchTask task) {
+    task.subscription = BackgroundTaskManager.watchTaskStatus(
+      task.workId,
+      interval: const Duration(seconds: 1),
+    ).listen((status) {
+      if (!mounted) return;
+      setState(() {
+        task.state = status.state;
+        task.progressPercent = status.progressPercent;
+        task.resultPath = status.resultPath;
+        task.errorMessage = status.errorMessage;
+      });
+    });
   }
 
   @override
   void dispose() {
     _urlController.dispose();
-    _fileNameController.dispose();
-    _headersController.dispose();
-    _cancelPoll?.call();
+    for (final task in _tasks) {
+      task.subscription?.cancel();
+    }
     super.dispose();
-  }
-
-  Future<void> _startFetch() async {
-    if (!_formKey.currentState!.validate()) return;
-
-    final url = _urlController.text.trim();
-    final fileName =
-        _fileNameController.text.trim().isEmpty
-            ? null
-            : _fileNameController.text.trim();
-    final headers =
-        _headersController.text.trim().isEmpty
-            ? null
-            : _headersController.text.trim();
-    final outputPath = await getDownloadsDirectory();
-
-    // Ensure output directory exists
-    final dir = Directory(outputPath);
-    if (!dir.existsSync()) {
-      dir.createSync(recursive: true);
-    }
-
-    setState(() {
-      _isProcessing = true;
-      _currentStatus = null;
-    });
-
-    if (_useBackground && BackgroundTaskManager.isSupported) {
-      // Request notification permission first
-      await BackgroundTaskManager.requestNotificationPermission();
-
-      final workId = await BackgroundTaskManager.scheduleUrlFetch(
-        url: url,
-        outputPath: outputPath,
-        fileName: fileName,
-        headers: headers,
-      );
-
-      if (workId != null) {
-        setState(() {
-          _activeWorkId = workId;
-        });
-
-        _history.insert(
-          0,
-          _FetchHistoryEntry(
-            url: url,
-            workId: workId,
-            timestamp: DateTime.now(),
-            state: 'ENQUEUED',
-          ),
-        );
-
-        _cancelPoll = BackgroundTaskManager.pollTaskStatus(workId, (status) {
-          if (mounted) {
-            setState(() {
-              _currentStatus = status;
-              if (_history.isNotEmpty && _history[0].workId == workId) {
-                _history[0].state = status.state;
-                _history[0].resultPath = status.resultPath;
-              }
-              if (status.isCompleted) {
-                _isProcessing = false;
-                _activeWorkId = null;
-              }
-            });
-          }
-        });
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text('Download scheduled in background'),
-              behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-            ),
-          );
-        }
-      } else {
-        setState(() {
-          _isProcessing = false;
-        });
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text(
-                'Failed to schedule background download. Is background processing enabled?',
-              ),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: Theme.of(context).colorScheme.error,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-            ),
-          );
-        }
-      }
-    } else {
-      // Foreground download (simple progress)
-      _performForegroundFetch(url, outputPath, fileName, headers);
-    }
-  }
-
-  Future<void> _performForegroundFetch(
-    String url,
-    String outputPath,
-    String? fileName,
-    String? headers,
-  ) async {
-    try {
-      final client = HttpClient();
-      final request = await client.getUrl(Uri.parse(url));
-      request.headers.set('User-Agent', 'RevEngi-App/1.0');
-
-      if (headers != null) {
-        for (final header in headers.split(';')) {
-          final parts = header.split(':');
-          if (parts.length == 2) {
-            request.headers.set(parts[0].trim(), parts[1].trim());
-          }
-        }
-      }
-
-      final response = await request.close();
-      final resolvedName =
-          fileName ?? url.split('/').last.split('?').first;
-      final outputFile = File('$outputPath/$resolvedName');
-
-      final totalBytes = response.contentLength;
-      var downloadedBytes = 0;
-      final sink = outputFile.openWrite();
-
-      await for (final chunk in response) {
-        sink.add(chunk);
-        downloadedBytes += chunk.length;
-
-        if (mounted) {
-          final percent =
-              totalBytes > 0
-                  ? ((downloadedBytes * 100) / totalBytes).toInt()
-                  : -1;
-          setState(() {
-            _currentStatus = BackgroundTaskStatus(
-              workId: 'foreground',
-              state: 'RUNNING',
-              progressPercent: percent,
-              progressBytes: downloadedBytes,
-              progressTotal: totalBytes,
-            );
-          });
-        }
-      }
-
-      await sink.flush();
-      await sink.close();
-      client.close();
-
-      _history.insert(
-        0,
-        _FetchHistoryEntry(
-          url: url,
-          workId: 'foreground',
-          timestamp: DateTime.now(),
-          state: 'SUCCEEDED',
-          resultPath: outputFile.path,
-        ),
-      );
-
-      if (mounted) {
-        setState(() {
-          _isProcessing = false;
-          _currentStatus = BackgroundTaskStatus(
-            workId: 'foreground',
-            state: 'SUCCEEDED',
-            resultPath: outputFile.path,
-            downloadedBytes: downloadedBytes,
-          );
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Downloaded to: ${outputFile.path}'),
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _isProcessing = false;
-          _currentStatus = BackgroundTaskStatus(
-            workId: 'foreground',
-            state: 'FAILED',
-            errorMessage: e.toString(),
-          );
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Download failed: $e'),
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: Theme.of(context).colorScheme.error,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-          ),
-        );
-      }
-    }
-  }
-
-  void _cancelCurrentTask() {
-    if (_activeWorkId != null) {
-      BackgroundTaskManager.cancelTask(_activeWorkId!);
-      _cancelPoll?.call();
-      setState(() {
-        _isProcessing = false;
-        _activeWorkId = null;
-        _currentStatus = null;
-      });
-    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final localizations = AppLocalizations.of(context)!;
     final theme = Theme.of(context);
-    final l10n = AppLocalizations.of(context)!;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('URL Fetch'), centerTitle: true),
       body: CustomScrollView(
+        physics: const BouncingScrollPhysics(),
         slivers: [
-          SliverPadding(
-            padding: const EdgeInsets.all(16),
-            sliver: SliverList(
-              delegate: SliverChildListDelegate([
-                // -- URL Input Form --
-                _buildFormSection(theme),
-                const SizedBox(height: 16),
-
-                // -- Progress Section --
-                if (_currentStatus != null) ...[
-                  _buildProgressSection(theme),
-                  const SizedBox(height: 16),
-                ],
-
-                // -- Action Buttons --
-                _buildActionButtons(theme, l10n),
-                const SizedBox(height: 24),
-
-                // -- Fetch History --
-                if (_history.isNotEmpty) ...[
-                  Text(
-                    'Recent Downloads',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  ..._history.map((entry) => _buildHistoryTile(theme, entry)),
-                ],
-              ]),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFormSection(ThemeData theme) {
-    return Form(
-      key: _formKey,
-      child: Card(
-        elevation: 0,
-        color: theme.colorScheme.surface,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-          side: BorderSide(color: theme.dividerColor),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
+          SliverAppBar(
+            expandedHeight: 180,
+            pinned: true,
+            stretch: true,
+            backgroundColor: theme.scaffoldBackgroundColor,
+            flexibleSpace: FlexibleSpaceBar(
+              title: Text(
+                localizations.backgroundUrlFetching,
+                style: TextStyle(
+                  color: theme.textTheme.titleLarge?.color,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 18,
+                ),
+              ),
+              centerTitle: true,
+              titlePadding: const EdgeInsets.only(bottom: 16),
+              background: Stack(
+                fit: StackFit.expand,
                 children: [
                   Container(
-                    padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
-                      color: theme.colorScheme.primary.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(
-                      Icons.download_rounded,
-                      color: theme.colorScheme.primary,
+                      gradient: LinearGradient(
+                        colors: [
+                          theme.colorScheme.primary.withValues(alpha: 0.15),
+                          theme.scaffoldBackgroundColor,
+                        ],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
                     ),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
+                  Positioned(
+                    right: -20,
+                    top: -20,
+                    child: Opacity(
+                      opacity: 0.1,
+                      child: Icon(
+                        Icons.cloud_download,
+                        size: 200,
+                        color: theme.colorScheme.primary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 24, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // URL input card
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surface,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: theme.dividerColor),
+                    ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Download Configuration',
-                          style: theme.textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.bold,
+                          localizations.backgroundUrlFetchingDesc,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: theme.textTheme.bodyMedium?.color
+                                ?.withValues(alpha: 0.7),
                           ),
                         ),
-                        Text(
-                          'Fetch APK or resource files from URLs',
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.textTheme.bodySmall?.color?.withValues(
-                              alpha: 0.6,
+                        const SizedBox(height: 16),
+                        TextField(
+                          controller: _urlController,
+                          decoration: InputDecoration(
+                            labelText: 'URL',
+                            hintText: 'https://example.com/file.apk',
+                            filled: true,
+                            fillColor:
+                                theme.colorScheme.surfaceContainerHighest,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide.none,
+                            ),
+                            prefixIcon: const Icon(Icons.link),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 14,
+                            ),
+                          ),
+                          keyboardType: TextInputType.url,
+                          onSubmitted: (_) => _startFetch(),
+                        ),
+                        if (_backgroundAvailable) ...[
+                          const SizedBox(height: 12),
+                          SwitchListTile.adaptive(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(
+                              'Background download',
+                              style: theme.textTheme.bodyMedium,
+                            ),
+                            subtitle: Text(
+                              'Continue downloading when app is closed',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.textTheme.bodySmall?.color
+                                    ?.withValues(alpha: 0.6),
+                              ),
+                            ),
+                            value: _backgroundMode,
+                            onChanged: (value) =>
+                                setState(() => _backgroundMode = value),
+                          ),
+                        ],
+                        const SizedBox(height: 16),
+                        SizedBox(
+                          height: 52,
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            icon: Icon(
+                              _backgroundMode
+                                  ? Icons.cloud_download
+                                  : Icons.download,
+                            ),
+                            label: Text(
+                              _backgroundMode
+                                  ? 'Fetch in Background'
+                                  : 'Fetch',
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            onPressed: _urlController.text.trim().isNotEmpty
+                                ? _startFetch
+                                : null,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: theme.colorScheme.primary,
+                              foregroundColor: theme.colorScheme.onPrimary,
+                              elevation: 2,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
                             ),
                           ),
                         ),
                       ],
                     ),
                   ),
+
+                  if (_tasks.isNotEmpty) ...[
+                    const SizedBox(height: 24),
+                    Text(
+                      'Downloads',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: theme.textTheme.titleSmall?.color
+                            ?.withValues(alpha: 0.6),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                 ],
               ),
-              const SizedBox(height: 20),
-
-              // URL field
-              TextFormField(
-                controller: _urlController,
-                decoration: InputDecoration(
-                  labelText: 'URL',
-                  hintText: 'https://example.com/file.apk',
-                  prefixIcon: const Icon(Icons.link),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                ),
-                keyboardType: TextInputType.url,
-                validator: (value) {
-                  if (value == null || value.trim().isEmpty) {
-                    return 'Please enter a URL';
-                  }
-                  final uri = Uri.tryParse(value.trim());
-                  if (uri == null || !uri.hasScheme) {
-                    return 'Please enter a valid URL';
-                  }
-                  return null;
-                },
-              ),
-              const SizedBox(height: 12),
-
-              // File name field (optional)
-              TextFormField(
-                controller: _fileNameController,
-                decoration: InputDecoration(
-                  labelText: 'File Name (optional)',
-                  hintText: 'custom_name.apk',
-                  prefixIcon: const Icon(Icons.insert_drive_file_outlined),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // Custom headers (optional, advanced)
-              TextFormField(
-                controller: _headersController,
-                decoration: InputDecoration(
-                  labelText: 'Headers (optional)',
-                  hintText: 'Authorization: Bearer token',
-                  prefixIcon: const Icon(Icons.code),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  helperText: 'Semicolon-separated key:value pairs',
-                ),
-                maxLines: 1,
-              ),
-              const SizedBox(height: 16),
-
-              // Background toggle
-              if (BackgroundTaskManager.isSupported)
-                SwitchListTile(
-                  title: const Text('Background Download'),
-                  subtitle: const Text(
-                    'Continue downloading when app is minimized',
-                  ),
-                  value: _useBackground,
-                  onChanged:
-                      _isProcessing
-                          ? null
-                          : (value) => setState(() => _useBackground = value),
-                  secondary: Icon(
-                    Icons.cloud_download_outlined,
-                    color: theme.colorScheme.primary,
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  contentPadding: EdgeInsets.zero,
-                ),
-            ],
+            ),
           ),
-        ),
+          // Task list
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 80),
+            sliver: SliverList(
+              delegate: SliverChildBuilderDelegate(
+                (context, index) => _TaskCard(
+                  task: _tasks[index],
+                  onCancel: () async {
+                    await BackgroundTaskManager.cancelTask(
+                        _tasks[index].workId);
+                    setState(() {
+                      _tasks[index].state = 'CANCELLED';
+                    });
+                  },
+                ),
+                childCount: _tasks.length,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
+}
 
-  Widget _buildProgressSection(ThemeData theme) {
-    final status = _currentStatus!;
-    final percent = status.progressPercent;
-    final isIndeterminate = percent < 0;
+class _FetchTask {
+  final String url;
+  final String workId;
+  final bool isBackground;
+  String state;
+  int progressPercent;
+  String? resultPath;
+  String? errorMessage;
+  StreamSubscription? subscription;
 
-    Color stateColor;
-    IconData stateIcon;
-    String stateLabel;
+  _FetchTask({
+    required this.url,
+    required this.workId,
+    required this.isBackground,
+    this.state = 'ENQUEUED',
+    this.progressPercent = -1,
+    this.resultPath,
+    this.errorMessage,
+  });
+}
 
-    if (status.isRunning) {
-      stateColor = theme.colorScheme.primary;
-      stateIcon = Icons.downloading;
-      stateLabel =
-          isIndeterminate
-              ? 'Downloading...'
-              : 'Downloading... $percent%';
-    } else if (status.isSucceeded) {
-      stateColor = Colors.green;
-      stateIcon = Icons.check_circle;
-      stateLabel = 'Download Complete';
-    } else if (status.isFailed) {
-      stateColor = theme.colorScheme.error;
-      stateIcon = Icons.error;
-      stateLabel = status.errorMessage ?? 'Download Failed';
-    } else if (status.isCancelled) {
-      stateColor = Colors.orange;
-      stateIcon = Icons.cancel;
-      stateLabel = 'Download Cancelled';
-    } else if (status.isEnqueued) {
-      stateColor = Colors.blue;
-      stateIcon = Icons.schedule;
-      stateLabel = 'Scheduled - Waiting for constraints';
-    } else {
-      stateColor = theme.colorScheme.onSurface;
-      stateIcon = Icons.info;
-      stateLabel = status.state;
+class _TaskCard extends StatelessWidget {
+  final _FetchTask task;
+  final VoidCallback onCancel;
+
+  const _TaskCard({required this.task, required this.onCancel});
+
+  Color _stateColor(ThemeData theme) {
+    switch (task.state) {
+      case 'SUCCEEDED':
+        return const Color(0xFF10B981);
+      case 'FAILED':
+        return const Color(0xFFEF4444);
+      case 'CANCELLED':
+        return const Color(0xFF6B7280);
+      case 'RUNNING':
+        return const Color(0xFF3B82F6);
+      default:
+        return const Color(0xFFF59E0B);
     }
+  }
+
+  IconData _stateIcon() {
+    switch (task.state) {
+      case 'SUCCEEDED':
+        return Icons.check_circle;
+      case 'FAILED':
+        return Icons.error;
+      case 'CANCELLED':
+        return Icons.cancel;
+      case 'RUNNING':
+        return Icons.downloading;
+      default:
+        return Icons.hourglass_empty;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final stateColor = _stateColor(theme);
 
     return Card(
       elevation: 0,
-      color: stateColor.withValues(alpha: 0.05),
+      margin: const EdgeInsets.only(bottom: 8),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(20),
-        side: BorderSide(color: stateColor.withValues(alpha: 0.2)),
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: theme.dividerColor),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                Icon(stateIcon, color: stateColor),
-                const SizedBox(width: 12),
+                Icon(_stateIcon(), size: 20, color: stateColor),
+                const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    stateLabel,
-                    style: theme.textTheme.titleSmall?.copyWith(
-                      color: stateColor,
+                    task.url,
+                    style: theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.w600,
                     ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-              ],
-            ),
-            if (status.isRunning) ...[
-              const SizedBox(height: 12),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child:
-                    isIndeterminate
-                        ? const LinearProgressIndicator()
-                        : LinearProgressIndicator(value: percent / 100.0),
-              ),
-              if (status.progressBytes > 0) ...[
-                const SizedBox(height: 8),
-                Text(
-                  _formatBytes(status.progressBytes) +
-                      (status.progressTotal > 0
-                          ? ' / ${_formatBytes(status.progressTotal)}'
-                          : ''),
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.textTheme.bodySmall?.color?.withValues(
-                      alpha: 0.6,
+                if (task.isBackground)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF6366F1).withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      'BG',
+                      style: TextStyle(
+                        color: const Color(0xFF6366F1),
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                   ),
-                ),
               ],
+            ),
+            if (task.state == 'RUNNING' && task.progressPercent >= 0) ...[
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: task.progressPercent / 100,
+                  backgroundColor: stateColor.withValues(alpha: 0.1),
+                  valueColor: AlwaysStoppedAnimation(stateColor),
+                  minHeight: 6,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '${task.progressPercent}%',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: stateColor,
+                ),
+              ),
+            ] else if (task.state == 'RUNNING') ...[
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  backgroundColor: stateColor.withValues(alpha: 0.1),
+                  valueColor: AlwaysStoppedAnimation(stateColor),
+                  minHeight: 6,
+                ),
+              ),
             ],
-            if (status.isSucceeded && status.resultPath != null) ...[
+            if (task.resultPath != null) ...[
               const SizedBox(height: 8),
               Text(
-                'Saved to: ${status.resultPath}',
-                style: theme.textTheme.bodySmall,
+                'Saved: ${task.resultPath}',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: const Color(0xFF10B981),
+                ),
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
+              ),
+            ],
+            if (task.errorMessage != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                task.errorMessage!,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: const Color(0xFFEF4444),
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+            if (task.state == 'RUNNING' || task.state == 'ENQUEUED') ...[
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  icon: const Icon(Icons.cancel_outlined, size: 16),
+                  label: const Text('Cancel'),
+                  onPressed: onCancel,
+                  style: TextButton.styleFrom(
+                    foregroundColor: const Color(0xFFEF4444),
+                  ),
+                ),
               ),
             ],
           ],
@@ -559,131 +507,4 @@ class _UrlFetchScreenState extends State<UrlFetchScreen> {
       ),
     );
   }
-
-  Widget _buildActionButtons(ThemeData theme, AppLocalizations l10n) {
-    return Row(
-      children: [
-        Expanded(
-          child: FilledButton.icon(
-            onPressed: _isProcessing ? null : _startFetch,
-            icon: const Icon(Icons.download),
-            label: Text(_isProcessing ? 'Downloading...' : 'Fetch'),
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 16),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-          ),
-        ),
-        if (_isProcessing && _activeWorkId != null) ...[
-          const SizedBox(width: 12),
-          FilledButton.tonalIcon(
-            onPressed: _cancelCurrentTask,
-            icon: const Icon(Icons.cancel_outlined),
-            label: Text(l10n.cancel),
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 16),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-              ),
-            ),
-          ),
-        ],
-      ],
-    );
-  }
-
-  Widget _buildHistoryTile(ThemeData theme, _FetchHistoryEntry entry) {
-    Color stateColor;
-    IconData stateIcon;
-
-    switch (entry.state) {
-      case 'SUCCEEDED':
-        stateColor = Colors.green;
-        stateIcon = Icons.check_circle_outline;
-        break;
-      case 'FAILED':
-        stateColor = theme.colorScheme.error;
-        stateIcon = Icons.error_outline;
-        break;
-      case 'RUNNING':
-        stateColor = theme.colorScheme.primary;
-        stateIcon = Icons.downloading;
-        break;
-      case 'CANCELLED':
-        stateColor = Colors.orange;
-        stateIcon = Icons.cancel_outlined;
-        break;
-      default:
-        stateColor = theme.colorScheme.onSurface.withValues(alpha: 0.5);
-        stateIcon = Icons.schedule;
-    }
-
-    return Card(
-      elevation: 0,
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(14),
-        side: BorderSide(color: theme.dividerColor),
-      ),
-      child: ListTile(
-        leading: Icon(stateIcon, color: stateColor),
-        title: Text(
-          entry.url,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.bodyMedium?.copyWith(
-            fontWeight: FontWeight.w500,
-          ),
-        ),
-        subtitle: Text(
-          '${_formatTime(entry.timestamp)} - ${entry.state}',
-          style: theme.textTheme.bodySmall?.copyWith(
-            color: stateColor.withValues(alpha: 0.8),
-          ),
-        ),
-        trailing:
-            entry.resultPath != null
-                ? Icon(
-                  Icons.folder_open,
-                  color: theme.colorScheme.primary,
-                  size: 20,
-                )
-                : null,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
-        ),
-      ),
-    );
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-  }
-
-  String _formatTime(DateTime dt) {
-    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-  }
-}
-
-class _FetchHistoryEntry {
-  final String url;
-  final String workId;
-  final DateTime timestamp;
-  String state;
-  String? resultPath;
-
-  _FetchHistoryEntry({
-    required this.url,
-    required this.workId,
-    required this.timestamp,
-    required this.state,
-    this.resultPath,
-  });
 }
