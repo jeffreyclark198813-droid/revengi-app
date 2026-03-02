@@ -2,15 +2,19 @@ package org.revengi.app
 
 import android.app.ActivityManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import org.revengi.app.arsclib.Merger
+import org.revengi.app.workers.WorkManagerHelper
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -58,6 +62,97 @@ class MainActivity : FlutterActivity() {
                         val success = zipApks(apkPaths!!, outputPath!!)
                         result.success(success)
                     }.start()
+                }
+
+                // --- WorkManager Background Task Handlers ---
+
+                "scheduleBackgroundMerge" -> {
+                    try {
+                        val options = call.arguments as? Map<String, Any?> ?: emptyMap()
+                        val requireCharging = options["requireCharging"] as? Boolean ?: false
+                        val workId = WorkManagerHelper.scheduleApkTransform(
+                            this@MainActivity,
+                            options,
+                            requireCharging,
+                        )
+                        result.success(mapOf("workId" to workId, "scheduled" to true))
+                    } catch (e: Exception) {
+                        result.error("SCHEDULE_ERROR", e.message, null)
+                    }
+                }
+
+                "scheduleUrlFetch" -> {
+                    try {
+                        val url = call.argument<String>("url")
+                            ?: return@setMethodCallHandler result.error("INVALID_ARG", "Missing url", null)
+                        val outputPath = call.argument<String>("outputPath")
+                            ?: return@setMethodCallHandler result.error("INVALID_ARG", "Missing outputPath", null)
+                        val fileName = call.argument<String>("fileName")
+                        val headers = call.argument<String>("headers")
+                        val wifiOnly = call.argument<Boolean>("wifiOnly") ?: false
+
+                        val workId = WorkManagerHelper.scheduleUrlFetch(
+                            this@MainActivity,
+                            url,
+                            outputPath,
+                            fileName,
+                            headers,
+                            wifiOnly,
+                        )
+                        result.success(mapOf("workId" to workId, "scheduled" to true))
+                    } catch (e: Exception) {
+                        result.error("SCHEDULE_ERROR", e.message, null)
+                    }
+                }
+
+                "cancelBackgroundWork" -> {
+                    try {
+                        val workId = call.argument<String>("workId")
+                        if (workId != null) {
+                            WorkManagerHelper.cancelWork(this@MainActivity, workId)
+                        } else {
+                            WorkManagerHelper.cancelAllWork(this@MainActivity)
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("CANCEL_ERROR", e.message, null)
+                    }
+                }
+
+                "getBackgroundWorkStatus" -> {
+                    try {
+                        val workId = call.argument<String>("workId")
+                        if (workId != null) {
+                            val status = WorkManagerHelper.getWorkStatus(this@MainActivity, workId)
+                            result.success(status)
+                        } else {
+                            result.error("INVALID_ARG", "Missing workId", null)
+                        }
+                    } catch (e: Exception) {
+                        result.error("STATUS_ERROR", e.message, null)
+                    }
+                }
+
+                "requestNotificationPermission" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        if (ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                android.Manifest.permission.POST_NOTIFICATIONS,
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            ActivityCompat.requestPermissions(
+                                this@MainActivity,
+                                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                                NOTIFICATION_PERMISSION_REQUEST_CODE,
+                            )
+                            result.success(false)
+                        } else {
+                            result.success(true)
+                        }
+                    } else {
+                        // Pre-Android 13 -- no runtime permission needed
+                        result.success(true)
+                    }
                 }
 
                 else -> {
@@ -134,6 +229,8 @@ class MainActivity : FlutterActivity() {
         }
 
     companion object {
+        private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 1100
+
         var eventSinkStatic: EventChannel.EventSink? = null
 
         @JvmStatic

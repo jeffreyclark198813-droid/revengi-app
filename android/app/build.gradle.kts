@@ -75,4 +75,6 @@ flutter {
 
 dependencies {
     implementation("com.github.reandroid:ARSCLib:2664403")
+    // WorkManager for background task processing (APK transforms, URL fetching)
+    implementation("androidx.work:work-runtime-ktx:2.11.1")
 }
